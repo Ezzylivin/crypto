@@ -1,0 +1,16 @@
+# backend/requirements.txt
+fastapi
+uvicorn[standard]
+sqlalchemy
+passlib[bcrypt]
+python-jose[cryptography]
+pandas
+pandas-ta
+scikit-learn
+ccxt
+python-multipart
+pydantic-settings
+boto3
+python-dotenv
+APScheduler
+requests
