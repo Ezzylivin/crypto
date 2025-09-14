@@ -1,0 +1,5 @@
+Flask
+pandas
+coinbase-advanced-py
+Flask-Cors
+gunicorn
