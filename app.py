@@ -24,26 +24,20 @@ def get_fred_data(start_date, end_date, api_key):
     """Fetches and processes real macroeconomic data from the FRED API."""
     base_url = "https://api.stlouisfed.org/fred/series/observations"
     all_series_data = {}
-
     for name, series_id in FRED_SERIES_IDS.items():
         params = {
-            "series_id": series_id,
-            "api_key": api_key,
-            "file_type": "json",
+            "series_id": series_id, "api_key": api_key, "file_type": "json",
             "observation_start": start_date.strftime('%Y-%m-%d'),
             "observation_end": end_date.strftime('%Y-%m-%d'),
         }
         response = requests.get(base_url, params=params)
         response.raise_for_status()
-        
         data = response.json()['observations']
-        df = pd.DataFrame(data)
-        df = df[['date', 'value']]
+        df = pd.DataFrame(data)[['date', 'value']]
         df['date'] = pd.to_datetime(df['date'])
         df.set_index('date', inplace=True)
         df['value'] = pd.to_numeric(df['value'], errors='coerce')
         all_series_data[name] = df['value']
-
     macro_df = pd.DataFrame(all_series_data)
     macro_df.ffill(inplace=True)
     return macro_df
@@ -52,18 +46,17 @@ def get_single_symbol_data(symbol, start_time, end_time):
     """Fetches historical price data for one symbol from Coinbase."""
     api_key = os.environ.get("COINBASE_API_KEY")
     api_secret = os.environ.get("COINBASE_API_SECRET")
+    if not api_key or not api_secret:
+        raise ValueError("Coinbase API keys are missing.")
     client = RESTClient(api_key=api_key, api_secret=api_secret)
-    
     response = client.get_candles(
         product_id=symbol,
         start=str(int(start_time.timestamp())),
         end=str(int(end_time.timestamp())),
         granularity="ONE_DAY"
     )
-    
     candle_dicts = [{"start": c.start, "high": c.high, "low": c.low, "open": c.open, "close": c.close, "volume": c.volume} for c in response.candles]
     if not candle_dicts: return None
-
     df = pd.DataFrame(candle_dicts)
     df['time'] = pd.to_datetime(pd.to_numeric(df['start']), unit='s')
     df.set_index('time', inplace=True)
@@ -83,9 +76,7 @@ def get_top_5_market_data():
     with ThreadPoolExecutor(max_workers=len(TOP_5_SYMBOLS) + 1) as executor:
         fred_future = executor.submit(get_fred_data, start_time, end_time, fred_api_key)
         coinbase_futures = {executor.submit(get_single_symbol_data, symbol, start_time, end_time): symbol for symbol in TOP_5_SYMBOLS}
-
         macro_df = fred_future.result()
-
         for future in coinbase_futures:
             symbol = coinbase_futures[future]
             try:
@@ -96,7 +87,6 @@ def get_top_5_market_data():
                     all_crypto_data[symbol] = combined_df
             except Exception as e:
                 print(f"Failed to process result for {symbol}: {e}")
-                
     return all_crypto_data
 
 def run_simple_moving_average_backtest(symbol, data_df):
@@ -129,6 +119,7 @@ def run_simple_moving_average_backtest(symbol, data_df):
 # --- API Endpoints ---
 @app.route('/api/data', methods=['GET'])
 def get_market_data_api():
+    """Serves the combined market data for the dashboard charts."""
     try:
         data_dict = get_top_5_market_data()
         json_payload = {}
@@ -143,6 +134,7 @@ def get_market_data_api():
 
 @app.route('/api/run-backtest', methods=['POST'])
 def run_backtest_api():
+    """Runs a backtest for a specific symbol provided by the frontend."""
     try:
         request_data = request.get_json()
         symbol_to_test = request_data.get('symbol')
