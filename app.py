@@ -7,12 +7,10 @@ import numpy as np
 from datetime import datetime, timedelta, timezone
 from coinbase.rest import RESTClient
 from concurrent.futures import ThreadPoolExecutor
-import re # 🛠️ Import the regular expression library
+import re
 
 app = Flask(__name__)
 
-# 🛠️ Updated CORS configuration to accept any .vercel.app subdomain
-# This uses a regular expression to match origins dynamically.
 vercel_regex = r"^https:\/\/.*\.vercel\.app$"
 CORS(app, resources={r"/api/*": {"origins": vercel_regex, "supports_credentials": True}})
 
@@ -159,4 +157,5 @@ def run_backtest_api():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    port = int(os.environ.get("PORT", 5001))
+    app.run(debug=True, host='0.0.0.0', port=port)
