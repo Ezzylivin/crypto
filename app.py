@@ -15,7 +15,7 @@ vercel_regex = r"^https:\/\/.*\.vercel\.app$"
 CORS(app, resources={r"/api/*": {"origins": vercel_regex, "supports_credentials": True}})
 
 # --- Configuration ---
-TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD"]
+TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD"]
 FRED_SERIES_IDS = {
     "fed_funds_rate": "FEDFUNDS",
     "cpi": "CPIAUCSL"
