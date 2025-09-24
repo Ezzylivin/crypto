@@ -22,25 +22,36 @@ FRED_SERIES_IDS = {
 }
 
 # --- Data Fetching Functions ---
-
 def get_fred_data(start_date, end_date, api_key):
     """Fetches and processes real macroeconomic data from the FRED API."""
     base_url = "https://api.stlouisfed.org/fred/series/observations"
+    
+    # Clamp end_date to today to avoid 500 errors
+    today = datetime.now(timezone.utc).date()
+    if end_date.date() > today:
+        end_date = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
+    
     all_series_data = {}
     for name, series_id in FRED_SERIES_IDS.items():
-        params = {
-            "series_id": series_id, "api_key": api_key, "file_type": "json",
-            "observation_start": start_date.strftime('%Y-%m-%d'),
-            "observation_end": end_date.strftime('%Y-%m-%d'),
-        }
-        response = requests.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()['observations']
-        df = pd.DataFrame(data)[['date', 'value']]
-        df['date'] = pd.to_datetime(df['date'])
-        df.set_index('date', inplace=True)
-        df['value'] = pd.to_numeric(df['value'], errors='coerce')
-        all_series_data[name] = df['value']
+        try:
+            params = {
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+                "observation_start": start_date.strftime('%Y-%m-%d'),
+                "observation_end": end_date.strftime('%Y-%m-%d'),
+            }
+            response = requests.get(base_url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json().get('observations', [])
+            df = pd.DataFrame(data)[['date', 'value']]
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+            df['value'] = pd.to_numeric(df['value'], errors='coerce')
+            all_series_data[name] = df['value']
+        except Exception as e:
+            print(f"[FRED ERROR] Failed to fetch {name}: {e}")
+            all_series_data[name] = pd.Series(dtype=float)
     macro_df = pd.DataFrame(all_series_data)
     macro_df.ffill(inplace=True)
     return macro_df
@@ -52,20 +63,24 @@ def get_single_symbol_data(symbol, start_time, end_time):
     if not api_key or not api_secret:
         raise ValueError("Coinbase API keys are missing.")
     client = RESTClient(api_key=api_key, api_secret=api_secret)
-    response = client.get_candles(
-        product_id=symbol,
-        start=str(int(start_time.timestamp())),
-        end=str(int(end_time.timestamp())),
-        granularity="ONE_DAY"
-    )
-    candle_dicts = [{"start": c.start, "high": c.high, "low": c.low, "open": c.open, "close": c.close, "volume": c.volume} for c in response.candles]
-    if not candle_dicts: return None
-    df = pd.DataFrame(candle_dicts)
-    df['time'] = pd.to_datetime(pd.to_numeric(df['start']), unit='s')
-    df.set_index('time', inplace=True)
-    df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
-    df.sort_index(inplace=True)
-    return df
+    try:
+        response = client.get_candles(
+            product_id=symbol,
+            start=str(int(start_time.timestamp())),
+            end=str(int(end_time.timestamp())),
+            granularity="ONE_DAY"
+        )
+        candle_dicts = [{"start": c.start, "high": c.high, "low": c.low, "open": c.open, "close": c.close, "volume": c.volume} for c in response.candles]
+        if not candle_dicts: return None
+        df = pd.DataFrame(candle_dicts)
+        df['time'] = pd.to_datetime(pd.to_numeric(df['start']), unit='s')
+        df.set_index('time', inplace=True)
+        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        df.sort_index(inplace=True)
+        return df
+    except Exception as e:
+        print(f"[COINBASE ERROR] Failed to fetch {symbol}: {e}")
+        return None
 
 def get_top_5_market_data():
     """Fetches all data sources concurrently for maximum speed."""
@@ -89,17 +104,19 @@ def get_top_5_market_data():
                     combined_df.ffill(inplace=True)
                     all_crypto_data[symbol] = combined_df
             except Exception as e:
-                print(f"Failed to process result for {symbol}: {e}")
+                print(f"[THREAD ERROR] Failed to process result for {symbol}: {e}")
     return all_crypto_data
 
 def run_simple_moving_average_backtest(symbol, data_df):
-    """Runs a simple backtest strategy."""
+    """Runs a simple moving average backtest strategy."""
     short_window, long_window = 10, 30
     signals = pd.DataFrame(index=data_df.index)
     signals['short_mavg'] = data_df['close'].rolling(window=short_window, min_periods=1).mean()
     signals['long_mavg'] = data_df['close'].rolling(window=long_window, min_periods=1).mean()
     signals['signal'] = 0.0
-    signals.loc[signals.index[short_window:], 'signal'] = np.where(signals['short_mavg'].iloc[short_window:] > signals['long_mavg'].iloc[short_window:], 1.0, 0.0)
+    signals.loc[signals.index[short_window:], 'signal'] = np.where(
+        signals['short_mavg'].iloc[short_window:] > signals['long_mavg'].iloc[short_window:], 1.0, 0.0
+    )
     signals['positions'] = signals['signal'].diff()
     initial_capital = 10000.0
     positions = pd.DataFrame(index=signals.index).fillna(0.0)
