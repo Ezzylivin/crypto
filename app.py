@@ -11,11 +11,21 @@ import re
 
 app = Flask(__name__)
 
+# Allow Vercel frontend to access this API
 vercel_regex = r"^https:\/\/.*\.vercel\.app$"
 CORS(app, resources={r"/api/*": {"origins": vercel_regex, "supports_credentials": True}})
 
 # --- Configuration ---
-TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD"]
+# Expanded list for the Dashboard Dropdown
+SUPPORTED_SYMBOLS = [
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD", 
+    "DOGE-USD", "AVAX-USD", "LINK-USD", "MATIC-USD", "LTC-USD", 
+    "DOT-USD", "SHIB-USD", "UNI-USD"
+]
+
+# Keep Top 5 for the main aggregate fetch to keep it fast
+TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD"]
+
 FRED_SERIES_IDS = {
     "fed_funds_rate": "FEDFUNDS",
     "cpi": "CPIAUCSL"
@@ -23,10 +33,7 @@ FRED_SERIES_IDS = {
 
 # --- Data Fetching Functions ---
 def get_fred_data(start_date, end_date, api_key):
-    """Fetches and processes real macroeconomic data from the FRED API."""
     base_url = "https://api.stlouisfed.org/fred/series/observations"
-    
-    # Clamp end_date to today to avoid 500 errors
     today = datetime.now(timezone.utc).date()
     if end_date.date() > today:
         end_date = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
@@ -35,143 +42,142 @@ def get_fred_data(start_date, end_date, api_key):
     for name, series_id in FRED_SERIES_IDS.items():
         try:
             params = {
-                "series_id": series_id,
-                "api_key": api_key,
-                "file_type": "json",
+                "series_id": series_id, "api_key": api_key, "file_type": "json",
                 "observation_start": start_date.strftime('%Y-%m-%d'),
                 "observation_end": end_date.strftime('%Y-%m-%d'),
             }
             response = requests.get(base_url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json().get('observations', [])
-            df = pd.DataFrame(data)[['date', 'value']]
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
-            df['value'] = pd.to_numeric(df['value'], errors='coerce')
-            all_series_data[name] = df['value']
+            if response.status_code == 200:
+                data = response.json().get('observations', [])
+                df = pd.DataFrame(data)[['date', 'value']]
+                df['date'] = pd.to_datetime(df['date'])
+                df.set_index('date', inplace=True)
+                df['value'] = pd.to_numeric(df['value'], errors='coerce')
+                all_series_data[name] = df['value']
         except Exception as e:
-            print(f"[FRED ERROR] Failed to fetch {name}: {e}")
+            print(f"[FRED ERROR] {name}: {e}")
             all_series_data[name] = pd.Series(dtype=float)
+    
     macro_df = pd.DataFrame(all_series_data)
     macro_df.ffill(inplace=True)
     return macro_df
 
-def get_single_symbol_data(symbol, start_time, end_time):
+def get_single_symbol_data(symbol, start_time, end_time, granularity="ONE_DAY"):
     """Fetches historical price data for one symbol from Coinbase."""
     api_key = os.environ.get("COINBASE_API_KEY")
     api_secret = os.environ.get("COINBASE_API_SECRET")
-    if not api_key or not api_secret:
-        raise ValueError("Coinbase API keys are missing.")
+    if not api_key or not api_secret: return None
+
     client = RESTClient(api_key=api_key, api_secret=api_secret)
     try:
         response = client.get_candles(
             product_id=symbol,
             start=str(int(start_time.timestamp())),
             end=str(int(end_time.timestamp())),
-            granularity="ONE_DAY"
+            granularity=granularity
         )
         candle_dicts = [{"start": c.start, "high": c.high, "low": c.low, "open": c.open, "close": c.close, "volume": c.volume} for c in response.candles]
         if not candle_dicts: return None
+        
         df = pd.DataFrame(candle_dicts)
+        # Convert start (seconds) to datetime
         df['time'] = pd.to_datetime(pd.to_numeric(df['start']), unit='s')
         df.set_index('time', inplace=True)
         df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
         df.sort_index(inplace=True)
         return df
     except Exception as e:
-        print(f"[COINBASE ERROR] Failed to fetch {symbol}: {e}")
+        print(f"[COINBASE ERROR] {symbol}: {e}")
         return None
 
-def get_top_5_market_data():
-    """Fetches all data sources concurrently for maximum speed."""
+def get_top_market_data():
+    """Fetches combined data for the main dashboard load."""
     fred_api_key = os.environ.get("FRED_API_KEY")
-    if not fred_api_key: raise ValueError("FRED API Key is missing.")
-    
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=90)
     all_crypto_data = {}
     
-    with ThreadPoolExecutor(max_workers=len(TOP_5_SYMBOLS) + 1) as executor:
-        fred_future = executor.submit(get_fred_data, start_time, end_time, fred_api_key)
-        coinbase_futures = {executor.submit(get_single_symbol_data, symbol, start_time, end_time): symbol for symbol in TOP_5_SYMBOLS}
-        macro_df = fred_future.result()
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        fred_future = executor.submit(get_fred_data, start_time, end_time, fred_api_key) if fred_api_key else None
+        coinbase_futures = {executor.submit(get_single_symbol_data, sym, start_time, end_time): sym for sym in TOP_5_SYMBOLS}
+        
+        macro_df = fred_future.result() if fred_future else pd.DataFrame()
+        
         for future in coinbase_futures:
             symbol = coinbase_futures[future]
             try:
                 symbol_df = future.result()
                 if symbol_df is not None:
-                    combined_df = symbol_df.join(macro_df, how='left')
-                    combined_df.ffill(inplace=True)
-                    all_crypto_data[symbol] = combined_df
-            except Exception as e:
-                print(f"[THREAD ERROR] Failed to process result for {symbol}: {e}")
+                    combined = symbol_df.join(macro_df, how='left').ffill() if not macro_df.empty else symbol_df
+                    all_crypto_data[symbol] = combined
+            except: pass
     return all_crypto_data
 
-def run_simple_moving_average_backtest(symbol, data_df):
-    """Runs a simple moving average backtest strategy."""
-    short_window, long_window = 10, 30
-    signals = pd.DataFrame(index=data_df.index)
-    signals['short_mavg'] = data_df['close'].rolling(window=short_window, min_periods=1).mean()
-    signals['long_mavg'] = data_df['close'].rolling(window=long_window, min_periods=1).mean()
-    signals['signal'] = 0.0
-    signals.loc[signals.index[short_window:], 'signal'] = np.where(
-        signals['short_mavg'].iloc[short_window:] > signals['long_mavg'].iloc[short_window:], 1.0, 0.0
-    )
-    signals['positions'] = signals['signal'].diff()
-    initial_capital = 10000.0
-    positions = pd.DataFrame(index=signals.index).fillna(0.0)
-    positions[symbol] = 1 * signals['positions']
-    portfolio = positions.multiply(data_df['close'], axis=0)
-    pos_diff = positions.diff()
-    portfolio['holdings'] = (positions.multiply(data_df['close'], axis=0)).sum(axis=1)
-    portfolio['cash'] = initial_capital - (pos_diff.multiply(data_df['close'], axis=0)).sum(axis=1).cumsum()
-    portfolio['total'] = portfolio['cash'] + portfolio['holdings']
-    returns = portfolio['total'].pct_change()
-    results = {
-        "initial_capital": initial_capital,
-        "final_value": portfolio['total'].iloc[-1],
-        "total_return_percent": ((portfolio['total'].iloc[-1] / initial_capital) - 1) * 100,
-        "total_trades": int(abs(signals['positions']).sum()),
-        "sharpe_ratio": (returns.mean() / returns.std()) * np.sqrt(365) if returns.std() != 0 else 0
-    }
-    return results
+# --- API ENDPOINTS ---
 
-# --- API Endpoints ---
+@app.route('/api/symbols', methods=['GET'])
+def get_symbols():
+    """Returns the list of available symbols for the dropdown."""
+    return jsonify(SUPPORTED_SYMBOLS)
+
+@app.route('/api/candles', methods=['GET'])
+def get_candles():
+    """
+    Returns specific candles for a selected chart.
+    Params: product_id (e.g. SOL-USD), granularity (ONE_DAY, SIX_HOUR, ONE_HOUR)
+    """
+    symbol = request.args.get('product_id', 'BTC-USD')
+    granularity = request.args.get('granularity', 'ONE_HOUR')
+    
+    # Calculate start time based on granularity
+    end_time = datetime.now(timezone.utc)
+    days_back = 30 # Default to 1 month of hourly data
+    if granularity == 'ONE_DAY': days_back = 365
+    start_time = end_time - timedelta(days=days_back)
+
+    df = get_single_symbol_data(symbol, start_time, end_time, granularity)
+    
+    if df is None or df.empty:
+        return jsonify([])
+    
+    # Format for Recharts
+    df_reset = df.reset_index()
+    records = []
+    for _, row in df_reset.iterrows():
+        records.append({
+            "start": int(row['start']), # Keep as number for sorting
+            "time": row['time'].isoformat(),
+            "open": row['open'],
+            "high": row['high'],
+            "low": row['low'],
+            "close": row['close'],
+            "volume": row['volume']
+        })
+    
+    return jsonify(records)
+
 @app.route('/api/data', methods=['GET'])
 def get_market_data_api():
-    """Serves the combined market data for the dashboard charts."""
+    """Legacy Endpoint: Returns heavy payload for initial load (Metric Cards + BTC/ETH)."""
     try:
-        data_dict = get_top_5_market_data()
+        data_dict = get_top_market_data()
         json_payload = {}
         for symbol, df in data_dict.items():
             df_reset = df.reset_index()
-            df_reset.rename(columns={'index': 'time'}, inplace=True)
-            df_reset['time'] = df_reset['time'].dt.strftime('%Y-%m-%d')
-            json_payload[symbol] = df_reset.to_dict(orient='records')
+            # Rename for frontend compatibility
+            json_payload[symbol] = []
+            for _, row in df_reset.iterrows():
+                entry = row.to_dict()
+                entry['time'] = row['time'].isoformat() # ISO string
+                if 'start' in entry: entry['start'] = int(entry['start'])
+                json_payload[symbol].append(entry)
         return jsonify(json_payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/run-backtest', methods=['POST'])
-def run_backtest_api():
-    """Runs a backtest for a specific symbol provided by the frontend."""
-    try:
-        request_data = request.get_json()
-        symbol_to_test = request_data.get('symbol')
-        if not symbol_to_test or symbol_to_test not in TOP_5_SYMBOLS:
-            return jsonify({"error": "A valid 'symbol' from the top 5 must be provided."}), 400
-        
-        end_time = datetime.now(timezone.utc)
-        start_time = end_time - timedelta(days=90)
-        symbol_data_df = get_single_symbol_data(symbol_to_test, start_time, end_time)
-        
-        if symbol_data_df is None:
-            return jsonify({"error": f"Could not fetch data for symbol {symbol_to_test}."}), 404
-            
-        backtest_results = run_simple_moving_average_backtest(symbol_to_test, symbol_data_df)
-        return jsonify(backtest_results)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5001))
