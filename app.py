@@ -5,7 +5,6 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-import ccxt
 from concurrent.futures import ThreadPoolExecutor
 import time
 
@@ -29,7 +28,6 @@ FRED_SERIES_IDS = {
 }
 
 # --- 🚀 CACHING SYSTEM ---
-# Stores data in memory: { "BTC-USD_ONE_HOUR": { "data": [...], "timestamp": 1234567890 } }
 CACHE = {}
 CACHE_TTL = 60  # Cache lives for 60 seconds
 
@@ -61,7 +59,6 @@ def clean_nan(obj):
 
 # --- Data Fetching ---
 def get_fred_data(start_date, end_date, api_key):
-    # Check Cache for Macro Data
     cache_key = "MACRO_DATA"
     cached = get_from_cache(cache_key)
     if cached is not None: return pd.DataFrame(cached)
@@ -90,48 +87,81 @@ def get_fred_data(start_date, end_date, api_key):
     macro_df = pd.DataFrame(all_series_data)
     macro_df.ffill(inplace=True)
     
-    # Save formatted dict to cache to avoid re-parsing
     save_to_cache(cache_key, macro_df.to_dict())
     return macro_df
 
 def get_single_symbol_data(symbol, start_time, end_time, granularity="ONE_DAY"):
+    """
+    Fetches candles from Coinbase Advanced Trade Public API (V3).
+    Endpoint: /api/v3/brokerage/market/products/{product_id}/candles
+    Limit: 300 candles max per request (strict).
+    """
     try:
-        exchange = ccxt.coinbase()
-        normalized = symbol.replace('-', '/')
+        # Construct URL
+        url = f"https://api.coinbase.com/api/v3/brokerage/market/products/{symbol}/candles"
         
-        timeframe_map = {'ONE_DAY': '1d', 'ONE_HOUR': '1h', 'SIX_HOUR': '6h'}
-        tf = timeframe_map.get(granularity, '1d')
-        
-        # Limit fetch to speed it up (300 candles is plenty for a quick chart)
-        ohlcv = exchange.fetch_ohlcv(normalized, tf, limit=300)
-        
-        if not ohlcv: return None
+        # Convert datetime to UNIX timestamp strings
+        start_ts = int(start_time.timestamp())
+        end_ts = int(end_time.timestamp())
 
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
+        params = {
+            "start": start_ts,
+            "end": end_ts,
+            "granularity": granularity
+        }
+
+        # Request to Coinbase (Public Endpoint, no Auth headers needed for market data)
+        response = requests.get(url, params=params, timeout=10)
+        
+        if response.status_code != 200:
+            print(f"[COINBASE ERROR] {symbol}: {response.status_code} - {response.text}")
+            return None
+
+        data = response.json()
+        candles = data.get('candles', [])
+
+        if not candles:
+            return None
+
+        # Parse into DataFrame
+        df = pd.DataFrame(candles)
+        
+        # Rename and cast columns to match previous CCXT structure
+        # API returns strings: "start", "low", "high", "open", "close", "volume"
+        df = df.rename(columns={'start': 'timestamp'})
+        cols = ['open', 'high', 'low', 'close', 'volume']
+        for col in cols:
+            df[col] = df[col].astype(float)
+        
+        # Create datetime index
+        df['time'] = pd.to_datetime(df['timestamp'], unit='s')
         df.set_index('time', inplace=True)
         
-        cols = ['open', 'high', 'low', 'close', 'volume']
-        df[cols] = df[cols].astype(float)
-        df['start'] = (df['timestamp'] / 1000).astype(int)
+        # Ensure 'start' is int for the API response
+        df['start'] = df['timestamp'].astype(int)
         
+        # Sort ascending (API usually returns newest first)
+        df.sort_index(inplace=True)
+
         return df
+
     except Exception as e:
-        print(f"[CCXT ERROR] {symbol}: {e}")
+        print(f"[API ERROR] {symbol}: {e}")
         return None
 
 def get_top_market_data():
     fred_api_key = os.environ.get("FRED_API_KEY")
     end_time = datetime.now(timezone.utc)
+    # 90 days for daily view matches the limit (90 < 300)
     start_time = end_time - timedelta(days=90)
     
     all_crypto_data = {}
     
-    # Use cached macro data if available inside get_fred_data
     macro_df = get_fred_data(start_time, end_time, fred_api_key) if fred_api_key else pd.DataFrame()
-    if isinstance(macro_df, dict): macro_df = pd.DataFrame(macro_df) # Rehydrate from cache if needed
+    if isinstance(macro_df, dict): macro_df = pd.DataFrame(macro_df)
 
     with ThreadPoolExecutor(max_workers=3) as executor:
+        # Granularity MUST be one of: ONE_MINUTE, FIVE_MINUTE, ONE_HOUR, SIX_HOUR, ONE_DAY
         futures = {executor.submit(get_single_symbol_data, sym, start_time, end_time, "ONE_DAY"): sym for sym in TOP_5_SYMBOLS}
         for future in futures:
             sym = futures[future]
@@ -155,14 +185,26 @@ def get_candles():
     symbol = request.args.get('product_id', 'BTC-USD')
     granularity = request.args.get('granularity', 'ONE_HOUR')
     
-    # 🚀 CHECK CACHE FIRST
     cache_key = f"{symbol}_{granularity}"
     cached_data = get_from_cache(cache_key)
     if cached_data:
         return jsonify(cached_data)
 
     end_time = datetime.now(timezone.utc)
-    days_back = 14 if granularity == 'ONE_HOUR' else 300
+    
+    # --- IMPORTANT: COINBASE ADVANCED LIMITS ---
+    # The API strictly rejects requests resulting in >300 candles.
+    # We must cap the time range based on granularity.
+    if granularity == 'ONE_HOUR':
+        # 300 hours = 12.5 days. Set to 12 days to be safe.
+        days_back = 12 
+    elif granularity == 'ONE_MINUTE':
+        # 300 minutes = 5 hours.
+        days_back = 0.2 
+    else:
+        # Default/Daily: 290 days (safe under 300 limit)
+        days_back = 290
+
     start_time = end_time - timedelta(days=days_back)
 
     df = get_single_symbol_data(symbol, start_time, end_time, granularity)
@@ -185,15 +227,12 @@ def get_candles():
         })
     
     final_data = clean_nan(records)
-    
-    # 🚀 SAVE TO CACHE
     save_to_cache(cache_key, final_data)
     
     return jsonify(final_data)
 
 @app.route('/api/data', methods=['GET'])
 def get_market_data_api():
-    # Cache the heavy homepage load too
     cache_key = "HOME_DATA"
     cached_data = get_from_cache(cache_key)
     if cached_data: return jsonify(cached_data)
