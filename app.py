@@ -15,16 +15,17 @@ app = Flask(__name__)
 vercel_regex = r"^https:\/\/.*\.vercel\.app$"
 CORS(app, resources={r"/api/*": {"origins": vercel_regex, "supports_credentials": True}})
 
-# --- Configuration ---
-# Expanded list for the Dashboard Dropdown
+# --- 1. CONFIGURATION ---
+
+# 🚀 NEW: The list for your Dashboard Dropdown
 SUPPORTED_SYMBOLS = [
     "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD", 
     "DOGE-USD", "AVAX-USD", "LINK-USD", "MATIC-USD", "LTC-USD", 
-    "DOT-USD", "SHIB-USD", "UNI-USD"
+    "DOT-USD", "SHIB-USD", "UNI-USD", "ATOM-USD", "XLM-USD"
 ]
 
-# Keep Top 5 for the main aggregate fetch to keep it fast
-TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD"]
+# Keep Top 2 fast for the initial landing load
+TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD"]
 
 FRED_SERIES_IDS = {
     "fed_funds_rate": "FEDFUNDS",
@@ -33,6 +34,7 @@ FRED_SERIES_IDS = {
 
 # --- Data Fetching Functions ---
 def get_fred_data(start_date, end_date, api_key):
+    """Fetches and processes real macroeconomic data from the FRED API."""
     base_url = "https://api.stlouisfed.org/fred/series/observations"
     today = datetime.now(timezone.utc).date()
     if end_date.date() > today:
@@ -115,24 +117,21 @@ def get_top_market_data():
 
 # --- API ENDPOINTS ---
 
+# 🚀 NEW: Endpoint for the Dashboard Dropdown
 @app.route('/api/symbols', methods=['GET'])
 def get_symbols():
-    """Returns the list of available symbols for the dropdown."""
     return jsonify(SUPPORTED_SYMBOLS)
 
+# 🚀 NEW: Endpoint for the Selected Chart (Hourly Data)
 @app.route('/api/candles', methods=['GET'])
 def get_candles():
-    """
-    Returns specific candles for a selected chart.
-    Params: product_id (e.g. SOL-USD), granularity (ONE_DAY, SIX_HOUR, ONE_HOUR)
-    """
     symbol = request.args.get('product_id', 'BTC-USD')
+    # Default to hourly for better charts, or daily if requested
     granularity = request.args.get('granularity', 'ONE_HOUR')
     
-    # Calculate start time based on granularity
     end_time = datetime.now(timezone.utc)
-    days_back = 30 # Default to 1 month of hourly data
-    if granularity == 'ONE_DAY': days_back = 365
+    # Fetch 30 days of hourly data or 365 days of daily data
+    days_back = 30 if granularity == 'ONE_HOUR' else 365
     start_time = end_time - timedelta(days=days_back)
 
     df = get_single_symbol_data(symbol, start_time, end_time, granularity)
@@ -140,12 +139,12 @@ def get_candles():
     if df is None or df.empty:
         return jsonify([])
     
-    # Format for Recharts
+    # Format for Frontend
     df_reset = df.reset_index()
     records = []
     for _, row in df_reset.iterrows():
         records.append({
-            "start": int(row['start']), # Keep as number for sorting
+            "start": int(row['start']), 
             "time": row['time'].isoformat(),
             "open": row['open'],
             "high": row['high'],
@@ -164,11 +163,10 @@ def get_market_data_api():
         json_payload = {}
         for symbol, df in data_dict.items():
             df_reset = df.reset_index()
-            # Rename for frontend compatibility
             json_payload[symbol] = []
             for _, row in df_reset.iterrows():
                 entry = row.to_dict()
-                entry['time'] = row['time'].isoformat() # ISO string
+                entry['time'] = row['time'].isoformat()
                 if 'start' in entry: entry['start'] = int(entry['start'])
                 json_payload[symbol].append(entry)
         return jsonify(json_payload)
