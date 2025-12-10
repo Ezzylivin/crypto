@@ -1,40 +1,34 @@
 import os
 import requests
 from flask import Flask, jsonify, request
-from flask_cors import CORS
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from coinbase.rest import RESTClient
+import ccxt  # 🚀 Replaces coinbase.rest
 from concurrent.futures import ThreadPoolExecutor
-import re
 
 app = Flask(__name__)
 
-# Allow Vercel frontend to access this API
-vercel_regex = r"^https:\/\/.*\.vercel\.app$"
-CORS(app, resources={r"/api/*": {"origins": vercel_regex, "supports_credentials": True}})
-
-# --- 1. CONFIGURATION ---
-
-# 🚀 NEW: The list for your Dashboard Dropdown
+# --- Configuration ---
+# Full list for Dashboard Dropdown
 SUPPORTED_SYMBOLS = [
-    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD", 
-    "DOGE-USD", "AVAX-USD", "LINK-USD", "MATIC-USD", "LTC-USD", 
-    "DOT-USD", "SHIB-USD", "UNI-USD", "ATOM-USD", "XLM-USD"
+    "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD", 
+    "DOGE/USD", "AVAX/USD", "LINK/USD", "MATIC/USD", "LTC/USD", 
+    "DOT/USD", "SHIB/USD", "UNI/USD"
 ]
 
-# Keep Top 2 fast for the initial landing load
-TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD"]
+# Keep Top 2 for main load speed
+TOP_5_SYMBOLS = ["BTC/USD", "ETH/USD"]
 
 FRED_SERIES_IDS = {
     "fed_funds_rate": "FEDFUNDS",
     "cpi": "CPIAUCSL"
 }
 
-# --- Data Fetching Functions ---
+# --- Data Fetching ---
+
 def get_fred_data(start_date, end_date, api_key):
-    """Fetches and processes real macroeconomic data from the FRED API."""
+    """Fetches macro data from St. Louis Fed."""
     base_url = "https://api.stlouisfed.org/fred/series/observations"
     today = datetime.now(timezone.utc).date()
     if end_date.date() > today:
@@ -64,88 +58,103 @@ def get_fred_data(start_date, end_date, api_key):
     macro_df.ffill(inplace=True)
     return macro_df
 
-def get_single_symbol_data(symbol, start_time, end_time, granularity="ONE_DAY"):
-    """Fetches historical price data for one symbol from Coinbase."""
-    api_key = os.environ.get("COINBASE_API_KEY")
-    api_secret = os.environ.get("COINBASE_API_SECRET")
-    if not api_key or not api_secret: return None
-
-    client = RESTClient(api_key=api_key, api_secret=api_secret)
+def get_single_symbol_data(symbol, timeframe='1d', limit=300):
+    """Fetches OHLCV data using CCXT (Coinbase)."""
     try:
-        response = client.get_candles(
-            product_id=symbol,
-            start=str(int(start_time.timestamp())),
-            end=str(int(end_time.timestamp())),
-            granularity=granularity
-        )
-        candle_dicts = [{"start": c.start, "high": c.high, "low": c.low, "open": c.open, "close": c.close, "volume": c.volume} for c in response.candles]
-        if not candle_dicts: return None
+        # Use CCXT for reliable data fetching
+        exchange = ccxt.coinbase({
+            'apiKey': os.environ.get("COINBASE_API_KEY"),
+            'secret': os.environ.get("COINBASE_API_SECRET"),
+            'timeout': 30000,
+            'enableRateLimit': True
+        })
         
-        df = pd.DataFrame(candle_dicts)
-        # Convert start (seconds) to datetime
-        df['time'] = pd.to_datetime(pd.to_numeric(df['start']), unit='s')
+        # Normalize symbol (e.g. BTC-USD -> BTC/USD)
+        normalized_symbol = symbol.replace('-', '/')
+        
+        # Fetch candles
+        ohlcv = exchange.fetch_ohlcv(normalized_symbol, timeframe, limit=limit)
+        
+        if not ohlcv: return None
+
+        # Convert to DataFrame
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('time', inplace=True)
-        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+        
+        # Keep numeric columns as floats
+        cols = ['open', 'high', 'low', 'close', 'volume']
+        df[cols] = df[cols].astype(float)
+        
+        # Add 'start' column (seconds) for frontend
+        df['start'] = (df['timestamp'] / 1000).astype(int)
+        
         df.sort_index(inplace=True)
         return df
+
     except Exception as e:
-        print(f"[COINBASE ERROR] {symbol}: {e}")
+        print(f"[CCXT ERROR] {symbol}: {e}")
         return None
 
 def get_top_market_data():
-    """Fetches combined data for the main dashboard load."""
+    """Fetches combined data for initial dashboard load."""
     fred_api_key = os.environ.get("FRED_API_KEY")
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=90)
     all_crypto_data = {}
     
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        # 1. Fetch Macro
         fred_future = executor.submit(get_fred_data, start_time, end_time, fred_api_key) if fred_api_key else None
-        coinbase_futures = {executor.submit(get_single_symbol_data, sym, start_time, end_time): sym for sym in TOP_5_SYMBOLS}
         
-        macro_df = fred_future.result() if fred_future else pd.DataFrame()
-        
-        for future in coinbase_futures:
-            symbol = coinbase_futures[future]
+        # 2. Fetch Top Crypto (Sequentially to avoid rate limits on free tiers)
+        for sym in TOP_5_SYMBOLS:
             try:
-                symbol_df = future.result()
-                if symbol_df is not None:
-                    combined = symbol_df.join(macro_df, how='left').ffill() if not macro_df.empty else symbol_df
-                    all_crypto_data[symbol] = combined
-            except: pass
+                df = get_single_symbol_data(sym, '1d', 90)
+                if df is not None:
+                    # Merge with Macro if available
+                    if fred_future:
+                        macro_df = fred_future.result()
+                        if not macro_df.empty:
+                            df = df.join(macro_df, how='left').ffill()
+                    
+                    # Convert 'BTC/USD' -> 'BTC-USD' for frontend keys
+                    key = sym.replace('/', '-')
+                    all_crypto_data[key] = df
+            except Exception as e:
+                print(f"Error fetching {sym}: {e}")
+
     return all_crypto_data
 
 # --- API ENDPOINTS ---
 
-# 🚀 NEW: Endpoint for the Dashboard Dropdown
 @app.route('/api/symbols', methods=['GET'])
 def get_symbols():
-    return jsonify(SUPPORTED_SYMBOLS)
+    # Return list formatted as 'BTC-USD'
+    return jsonify([s.replace('/', '-') for s in SUPPORTED_SYMBOLS])
 
-# 🚀 NEW: Endpoint for the Selected Chart (Hourly Data)
 @app.route('/api/candles', methods=['GET'])
 def get_candles():
-    symbol = request.args.get('product_id', 'BTC-USD')
-    # Default to hourly for better charts, or daily if requested
+    # Frontend sends 'BTC-USD', we convert to 'BTC/USD' logic
+    symbol = request.args.get('product_id', 'BTC-USD').replace('-', '/')
     granularity = request.args.get('granularity', 'ONE_HOUR')
     
-    end_time = datetime.now(timezone.utc)
-    # Fetch 30 days of hourly data or 365 days of daily data
-    days_back = 30 if granularity == 'ONE_HOUR' else 365
-    start_time = end_time - timedelta(days=days_back)
+    # Map granularity to CCXT timeframe
+    timeframe = '1h'
+    if granularity == 'ONE_DAY': timeframe = '1d'
+    elif granularity == '15m': timeframe = '15m'
 
-    df = get_single_symbol_data(symbol, start_time, end_time, granularity)
+    df = get_single_symbol_data(symbol, timeframe, 300)
     
     if df is None or df.empty:
         return jsonify([])
     
-    # Format for Frontend
-    df_reset = df.reset_index()
+    # Format for Recharts
     records = []
-    for _, row in df_reset.iterrows():
+    for _, row in df.iterrows():
         records.append({
             "start": int(row['start']), 
-            "time": row['time'].isoformat(),
+            "time": row.name.isoformat(), # datetime index -> string
             "open": row['open'],
             "high": row['high'],
             "low": row['low'],
@@ -157,7 +166,7 @@ def get_candles():
 
 @app.route('/api/data', methods=['GET'])
 def get_market_data_api():
-    """Legacy Endpoint: Returns heavy payload for initial load (Metric Cards + BTC/ETH)."""
+    """Legacy Endpoint: Returns heavy payload for initial load."""
     try:
         data_dict = get_top_market_data()
         json_payload = {}
