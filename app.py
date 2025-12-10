@@ -5,8 +5,9 @@ from flask_cors import CORS
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-from coinbase.rest import RESTClient  # 🚀 Using Official Library
+import ccxt
 from concurrent.futures import ThreadPoolExecutor
+import time
 
 app = Flask(__name__)
 
@@ -27,9 +28,29 @@ FRED_SERIES_IDS = {
     "cpi": "CPIAUCSL"
 }
 
+# --- 🚀 CACHING SYSTEM ---
+# Stores data in memory: { "BTC-USD_ONE_HOUR": { "data": [...], "timestamp": 1234567890 } }
+CACHE = {}
+CACHE_TTL = 60  # Cache lives for 60 seconds
+
+def get_from_cache(key):
+    """Retrieve data if it exists and is fresh."""
+    if key in CACHE:
+        entry = CACHE[key]
+        if time.time() - entry['timestamp'] < CACHE_TTL:
+            print(f"⚡ Served {key} from CACHE")
+            return entry['data']
+    return None
+
+def save_to_cache(key, data):
+    """Save data to memory with current timestamp."""
+    CACHE[key] = {
+        "data": data,
+        "timestamp": time.time()
+    }
+
 # --- Helper to Fix NaN JSON Crash ---
 def clean_nan(obj):
-    """Recursively replace NaN/Infinity with None (null in JSON)."""
     if isinstance(obj, float):
         return None if np.isnan(obj) or np.isinf(obj) else obj
     elif isinstance(obj, dict):
@@ -40,13 +61,14 @@ def clean_nan(obj):
 
 # --- Data Fetching ---
 def get_fred_data(start_date, end_date, api_key):
-    """Fetches macro data from FRED."""
+    # Check Cache for Macro Data
+    cache_key = "MACRO_DATA"
+    cached = get_from_cache(cache_key)
+    if cached is not None: return pd.DataFrame(cached)
+
     base_url = "https://api.stlouisfed.org/fred/series/observations"
-    today = datetime.now(timezone.utc).date()
-    if end_date.date() > today:
-        end_date = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
-    
     all_series_data = {}
+    
     for name, series_id in FRED_SERIES_IDS.items():
         try:
             params = {
@@ -54,7 +76,7 @@ def get_fred_data(start_date, end_date, api_key):
                 "observation_start": start_date.strftime('%Y-%m-%d'),
                 "observation_end": end_date.strftime('%Y-%m-%d'),
             }
-            response = requests.get(base_url, params=params, timeout=10)
+            response = requests.get(base_url, params=params, timeout=5)
             if response.status_code == 200:
                 data = response.json().get('observations', [])
                 df = pd.DataFrame(data)[['date', 'value']]
@@ -67,71 +89,47 @@ def get_fred_data(start_date, end_date, api_key):
     
     macro_df = pd.DataFrame(all_series_data)
     macro_df.ffill(inplace=True)
+    
+    # Save formatted dict to cache to avoid re-parsing
+    save_to_cache(cache_key, macro_df.to_dict())
     return macro_df
 
 def get_single_symbol_data(symbol, start_time, end_time, granularity="ONE_DAY"):
-    """Fetches OHLCV data using coinbase-advanced-py."""
-    api_key = os.environ.get("COINBASE_API_KEY")
-    api_secret = os.environ.get("COINBASE_API_SECRET")
-    
-    if not api_key or not api_secret:
-        print("Error: Missing Coinbase Credentials")
-        return None
-
     try:
-        client = RESTClient(api_key=api_key, api_secret=api_secret)
+        exchange = ccxt.coinbase()
+        normalized = symbol.replace('-', '/')
         
-        # Convert timestamps to string integers (required by this lib)
-        start_ts = str(int(start_time.timestamp()))
-        end_ts = str(int(end_time.timestamp()))
+        timeframe_map = {'ONE_DAY': '1d', 'ONE_HOUR': '1h', 'SIX_HOUR': '6h'}
+        tf = timeframe_map.get(granularity, '1d')
         
-        # Fetch Candles
-        response = client.get_candles(
-            product_id=symbol,
-            start=start_ts,
-            end=end_ts,
-            granularity=granularity
-        )
+        # Limit fetch to speed it up (300 candles is plenty for a quick chart)
+        ohlcv = exchange.fetch_ohlcv(normalized, tf, limit=300)
         
-        # Parse the 'candles' list from the response object
-        if not hasattr(response, 'candles') or not response.candles:
-            return None
+        if not ohlcv: return None
 
-        # Convert candle objects to dicts
-        candles_data = []
-        for c in response.candles:
-            candles_data.append({
-                "start": float(c.start),
-                "open": float(c.open),
-                "high": float(c.high),
-                "low": float(c.low),
-                "close": float(c.close),
-                "volume": float(c.volume)
-            })
-
-        df = pd.DataFrame(candles_data)
-        # Ensure we have data before processing
-        if df.empty: return None
-        
-        df['time'] = pd.to_datetime(df['start'], unit='s')
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('time', inplace=True)
-        df.sort_index(inplace=True)
+        
+        cols = ['open', 'high', 'low', 'close', 'volume']
+        df[cols] = df[cols].astype(float)
+        df['start'] = (df['timestamp'] / 1000).astype(int)
         
         return df
-
     except Exception as e:
-        print(f"[COINBASE ERROR] {symbol}: {e}")
+        print(f"[CCXT ERROR] {symbol}: {e}")
         return None
 
 def get_top_market_data():
-    """Fetches combined data for initial dashboard load."""
     fred_api_key = os.environ.get("FRED_API_KEY")
     end_time = datetime.now(timezone.utc)
-    # Fetch 90 days for daily charts is fine (90 < 350)
     start_time = end_time - timedelta(days=90)
     
     all_crypto_data = {}
+    
+    # Use cached macro data if available inside get_fred_data
     macro_df = get_fred_data(start_time, end_time, fred_api_key) if fred_api_key else pd.DataFrame()
+    if isinstance(macro_df, dict): macro_df = pd.DataFrame(macro_df) # Rehydrate from cache if needed
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(get_single_symbol_data, sym, start_time, end_time, "ONE_DAY"): sym for sym in TOP_5_SYMBOLS}
@@ -142,10 +140,7 @@ def get_top_market_data():
                 if df is not None:
                     if not macro_df.empty:
                         df = df.join(macro_df, how='left').ffill()
-                    
-                    # 🚀 FIX: Convert NaN to None immediately here
-                    df = df.replace({np.nan: None})
-                    all_crypto_data[sym] = df
+                    all_crypto_data[sym] = df.replace({np.nan: None})
             except: pass
     return all_crypto_data
 
@@ -158,19 +153,16 @@ def get_symbols():
 @app.route('/api/candles', methods=['GET'])
 def get_candles():
     symbol = request.args.get('product_id', 'BTC-USD')
-    # Frontend sends 'ONE_HOUR', 'ONE_DAY' etc.
     granularity = request.args.get('granularity', 'ONE_HOUR')
     
+    # 🚀 CHECK CACHE FIRST
+    cache_key = f"{symbol}_{granularity}"
+    cached_data = get_from_cache(cache_key)
+    if cached_data:
+        return jsonify(cached_data)
+
     end_time = datetime.now(timezone.utc)
-    
-    # 🚀 FIX: RESPECT COINBASE 350 CANDLE LIMIT
-    # Hourly: 350 hours ~= 14.5 days. Use 14 days max.
-    # Daily: 350 days max. Use 300 days.
-    if granularity == 'ONE_HOUR':
-        days_back = 14 
-    else:
-        days_back = 300 
-        
+    days_back = 14 if granularity == 'ONE_HOUR' else 300
     start_time = end_time - timedelta(days=days_back)
 
     df = get_single_symbol_data(symbol, start_time, end_time, granularity)
@@ -178,7 +170,7 @@ def get_candles():
     if df is None or df.empty:
         return jsonify([])
     
-    # Format for Frontend
+    df = df.replace({np.nan: None})
     df_reset = df.reset_index()
     records = []
     for _, row in df_reset.iterrows():
@@ -192,12 +184,20 @@ def get_candles():
             "volume": row['volume']
         })
     
-    # Clean NaNs before sending JSON
-    return jsonify(clean_nan(records))
+    final_data = clean_nan(records)
+    
+    # 🚀 SAVE TO CACHE
+    save_to_cache(cache_key, final_data)
+    
+    return jsonify(final_data)
 
 @app.route('/api/data', methods=['GET'])
 def get_market_data_api():
-    """Legacy Endpoint: Returns heavy payload for initial load."""
+    # Cache the heavy homepage load too
+    cache_key = "HOME_DATA"
+    cached_data = get_from_cache(cache_key)
+    if cached_data: return jsonify(cached_data)
+
     try:
         data_dict = get_top_market_data()
         json_payload = {}
@@ -211,7 +211,8 @@ def get_market_data_api():
                 cleaned_records.append(r)
                 
             json_payload[symbol] = clean_nan(cleaned_records)
-            
+        
+        save_to_cache(cache_key, json_payload)
         return jsonify(json_payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
