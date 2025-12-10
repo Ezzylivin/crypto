@@ -110,6 +110,9 @@ def get_single_symbol_data(symbol, start_time, end_time, granularity="ONE_DAY"):
             })
 
         df = pd.DataFrame(candles_data)
+        # Ensure we have data before processing
+        if df.empty: return None
+        
         df['time'] = pd.to_datetime(df['start'], unit='s')
         df.set_index('time', inplace=True)
         df.sort_index(inplace=True)
@@ -124,6 +127,7 @@ def get_top_market_data():
     """Fetches combined data for initial dashboard load."""
     fred_api_key = os.environ.get("FRED_API_KEY")
     end_time = datetime.now(timezone.utc)
+    # Fetch 90 days for daily charts is fine (90 < 350)
     start_time = end_time - timedelta(days=90)
     
     all_crypto_data = {}
@@ -138,6 +142,9 @@ def get_top_market_data():
                 if df is not None:
                     if not macro_df.empty:
                         df = df.join(macro_df, how='left').ffill()
+                    
+                    # 🚀 FIX: Convert NaN to None immediately here
+                    df = df.replace({np.nan: None})
                     all_crypto_data[sym] = df
             except: pass
     return all_crypto_data
@@ -151,11 +158,19 @@ def get_symbols():
 @app.route('/api/candles', methods=['GET'])
 def get_candles():
     symbol = request.args.get('product_id', 'BTC-USD')
-    # Frontend sends 'ONE_HOUR', 'ONE_DAY' etc. which matches this library's expected format
+    # Frontend sends 'ONE_HOUR', 'ONE_DAY' etc.
     granularity = request.args.get('granularity', 'ONE_HOUR')
     
     end_time = datetime.now(timezone.utc)
-    days_back = 30 if granularity == 'ONE_HOUR' else 365
+    
+    # 🚀 FIX: RESPECT COINBASE 350 CANDLE LIMIT
+    # Hourly: 350 hours ~= 14.5 days. Use 14 days max.
+    # Daily: 350 days max. Use 300 days.
+    if granularity == 'ONE_HOUR':
+        days_back = 14 
+    else:
+        days_back = 300 
+        
     start_time = end_time - timedelta(days=days_back)
 
     df = get_single_symbol_data(symbol, start_time, end_time, granularity)
