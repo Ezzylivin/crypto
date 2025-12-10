@@ -1,34 +1,46 @@
 import os
 import requests
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-import ccxt  # 🚀 Replaces coinbase.rest
+from coinbase.rest import RESTClient  # 🚀 Using Official Library
 from concurrent.futures import ThreadPoolExecutor
 
 app = Flask(__name__)
 
+# Allow Vercel frontend to access this API
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
 # --- Configuration ---
-# Full list for Dashboard Dropdown
 SUPPORTED_SYMBOLS = [
-    "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "ADA/USD", 
-    "DOGE/USD", "AVAX/USD", "LINK/USD", "MATIC/USD", "LTC/USD", 
-    "DOT/USD", "SHIB/USD", "UNI/USD"
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD", 
+    "DOGE-USD", "AVAX-USD", "LINK-USD", "MATIC-USD", "LTC-USD", 
+    "DOT-USD", "SHIB-USD", "UNI-USD"
 ]
 
-# Keep Top 2 for main load speed
-TOP_5_SYMBOLS = ["BTC/USD", "ETH/USD"]
+TOP_5_SYMBOLS = ["BTC-USD", "ETH-USD"]
 
 FRED_SERIES_IDS = {
     "fed_funds_rate": "FEDFUNDS",
     "cpi": "CPIAUCSL"
 }
 
-# --- Data Fetching ---
+# --- Helper to Fix NaN JSON Crash ---
+def clean_nan(obj):
+    """Recursively replace NaN/Infinity with None (null in JSON)."""
+    if isinstance(obj, float):
+        return None if np.isnan(obj) or np.isinf(obj) else obj
+    elif isinstance(obj, dict):
+        return {k: clean_nan(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nan(v) for v in obj]
+    return obj
 
+# --- Data Fetching ---
 def get_fred_data(start_date, end_date, api_key):
-    """Fetches macro data from St. Louis Fed."""
+    """Fetches macro data from FRED."""
     base_url = "https://api.stlouisfed.org/fred/series/observations"
     today = datetime.now(timezone.utc).date()
     if end_date.date() > today:
@@ -42,7 +54,7 @@ def get_fred_data(start_date, end_date, api_key):
                 "observation_start": start_date.strftime('%Y-%m-%d'),
                 "observation_end": end_date.strftime('%Y-%m-%d'),
             }
-            response = requests.get(base_url, params=params, timeout=15)
+            response = requests.get(base_url, params=params, timeout=10)
             if response.status_code == 200:
                 data = response.json().get('observations', [])
                 df = pd.DataFrame(data)[['date', 'value']]
@@ -50,50 +62,62 @@ def get_fred_data(start_date, end_date, api_key):
                 df.set_index('date', inplace=True)
                 df['value'] = pd.to_numeric(df['value'], errors='coerce')
                 all_series_data[name] = df['value']
-        except Exception as e:
-            print(f"[FRED ERROR] {name}: {e}")
+        except:
             all_series_data[name] = pd.Series(dtype=float)
     
     macro_df = pd.DataFrame(all_series_data)
     macro_df.ffill(inplace=True)
     return macro_df
 
-def get_single_symbol_data(symbol, timeframe='1d', limit=300):
-    """Fetches OHLCV data using CCXT (Coinbase)."""
-    try:
-        # Use CCXT for reliable data fetching
-        exchange = ccxt.coinbase({
-            'apiKey': os.environ.get("COINBASE_API_KEY"),
-            'secret': os.environ.get("COINBASE_API_SECRET"),
-            'timeout': 30000,
-            'enableRateLimit': True
-        })
-        
-        # Normalize symbol (e.g. BTC-USD -> BTC/USD)
-        normalized_symbol = symbol.replace('-', '/')
-        
-        # Fetch candles
-        ohlcv = exchange.fetch_ohlcv(normalized_symbol, timeframe, limit=limit)
-        
-        if not ohlcv: return None
+def get_single_symbol_data(symbol, start_time, end_time, granularity="ONE_DAY"):
+    """Fetches OHLCV data using coinbase-advanced-py."""
+    api_key = os.environ.get("COINBASE_API_KEY")
+    api_secret = os.environ.get("COINBASE_API_SECRET")
+    
+    if not api_key or not api_secret:
+        print("Error: Missing Coinbase Credentials")
+        return None
 
-        # Convert to DataFrame
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['time'] = pd.to_datetime(df['timestamp'], unit='ms')
+    try:
+        client = RESTClient(api_key=api_key, api_secret=api_secret)
+        
+        # Convert timestamps to string integers (required by this lib)
+        start_ts = str(int(start_time.timestamp()))
+        end_ts = str(int(end_time.timestamp()))
+        
+        # Fetch Candles
+        response = client.get_candles(
+            product_id=symbol,
+            start=start_ts,
+            end=end_ts,
+            granularity=granularity
+        )
+        
+        # Parse the 'candles' list from the response object
+        if not hasattr(response, 'candles') or not response.candles:
+            return None
+
+        # Convert candle objects to dicts
+        candles_data = []
+        for c in response.candles:
+            candles_data.append({
+                "start": float(c.start),
+                "open": float(c.open),
+                "high": float(c.high),
+                "low": float(c.low),
+                "close": float(c.close),
+                "volume": float(c.volume)
+            })
+
+        df = pd.DataFrame(candles_data)
+        df['time'] = pd.to_datetime(df['start'], unit='s')
         df.set_index('time', inplace=True)
-        
-        # Keep numeric columns as floats
-        cols = ['open', 'high', 'low', 'close', 'volume']
-        df[cols] = df[cols].astype(float)
-        
-        # Add 'start' column (seconds) for frontend
-        df['start'] = (df['timestamp'] / 1000).astype(int)
-        
         df.sort_index(inplace=True)
+        
         return df
 
     except Exception as e:
-        print(f"[CCXT ERROR] {symbol}: {e}")
+        print(f"[COINBASE ERROR] {symbol}: {e}")
         return None
 
 def get_top_market_data():
@@ -101,60 +125,51 @@ def get_top_market_data():
     fred_api_key = os.environ.get("FRED_API_KEY")
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(days=90)
-    all_crypto_data = {}
     
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        # 1. Fetch Macro
-        fred_future = executor.submit(get_fred_data, start_time, end_time, fred_api_key) if fred_api_key else None
-        
-        # 2. Fetch Top Crypto (Sequentially to avoid rate limits on free tiers)
-        for sym in TOP_5_SYMBOLS:
-            try:
-                df = get_single_symbol_data(sym, '1d', 90)
-                if df is not None:
-                    # Merge with Macro if available
-                    if fred_future:
-                        macro_df = fred_future.result()
-                        if not macro_df.empty:
-                            df = df.join(macro_df, how='left').ffill()
-                    
-                    # Convert 'BTC/USD' -> 'BTC-USD' for frontend keys
-                    key = sym.replace('/', '-')
-                    all_crypto_data[key] = df
-            except Exception as e:
-                print(f"Error fetching {sym}: {e}")
+    all_crypto_data = {}
+    macro_df = get_fred_data(start_time, end_time, fred_api_key) if fred_api_key else pd.DataFrame()
 
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(get_single_symbol_data, sym, start_time, end_time, "ONE_DAY"): sym for sym in TOP_5_SYMBOLS}
+        for future in futures:
+            sym = futures[future]
+            try:
+                df = future.result()
+                if df is not None:
+                    if not macro_df.empty:
+                        df = df.join(macro_df, how='left').ffill()
+                    all_crypto_data[sym] = df
+            except: pass
     return all_crypto_data
 
 # --- API ENDPOINTS ---
 
 @app.route('/api/symbols', methods=['GET'])
 def get_symbols():
-    # Return list formatted as 'BTC-USD'
-    return jsonify([s.replace('/', '-') for s in SUPPORTED_SYMBOLS])
+    return jsonify(SUPPORTED_SYMBOLS)
 
 @app.route('/api/candles', methods=['GET'])
 def get_candles():
-    # Frontend sends 'BTC-USD', we convert to 'BTC/USD' logic
-    symbol = request.args.get('product_id', 'BTC-USD').replace('-', '/')
+    symbol = request.args.get('product_id', 'BTC-USD')
+    # Frontend sends 'ONE_HOUR', 'ONE_DAY' etc. which matches this library's expected format
     granularity = request.args.get('granularity', 'ONE_HOUR')
     
-    # Map granularity to CCXT timeframe
-    timeframe = '1h'
-    if granularity == 'ONE_DAY': timeframe = '1d'
-    elif granularity == '15m': timeframe = '15m'
+    end_time = datetime.now(timezone.utc)
+    days_back = 30 if granularity == 'ONE_HOUR' else 365
+    start_time = end_time - timedelta(days=days_back)
 
-    df = get_single_symbol_data(symbol, timeframe, 300)
+    df = get_single_symbol_data(symbol, start_time, end_time, granularity)
     
     if df is None or df.empty:
         return jsonify([])
     
-    # Format for Recharts
+    # Format for Frontend
+    df_reset = df.reset_index()
     records = []
-    for _, row in df.iterrows():
+    for _, row in df_reset.iterrows():
         records.append({
-            "start": int(row['start']), 
-            "time": row.name.isoformat(), # datetime index -> string
+            "start": int(row['start']),
+            "time": row['time'].isoformat(),
             "open": row['open'],
             "high": row['high'],
             "low": row['low'],
@@ -162,7 +177,8 @@ def get_candles():
             "volume": row['volume']
         })
     
-    return jsonify(records)
+    # Clean NaNs before sending JSON
+    return jsonify(clean_nan(records))
 
 @app.route('/api/data', methods=['GET'])
 def get_market_data_api():
@@ -172,12 +188,15 @@ def get_market_data_api():
         json_payload = {}
         for symbol, df in data_dict.items():
             df_reset = df.reset_index()
-            json_payload[symbol] = []
-            for _, row in df_reset.iterrows():
-                entry = row.to_dict()
-                entry['time'] = row['time'].isoformat()
-                if 'start' in entry: entry['start'] = int(entry['start'])
-                json_payload[symbol].append(entry)
+            records = df_reset.to_dict(orient='records')
+            
+            cleaned_records = []
+            for r in records:
+                r['time'] = r['time'].isoformat() if isinstance(r['time'], pd.Timestamp) else str(r['time'])
+                cleaned_records.append(r)
+                
+            json_payload[symbol] = clean_nan(cleaned_records)
+            
         return jsonify(json_payload)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
